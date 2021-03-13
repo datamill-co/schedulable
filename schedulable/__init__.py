@@ -1,7 +1,10 @@
+import uuid
 import inspect
 from datetime import datetime
 
 import sqlalchemy as sa
+from sqlalchemy.orm import declared_attr
+from sqlalchemy.future import select
 from croniter import croniter
 
 NEXT_JOBS_SQL_TEMPLATE = '''
@@ -75,48 +78,39 @@ WHERE {table}.id = worker_job.id
 RETURNING {table}.*;
 '''
 
-SCHEDULER_LOCK_JOBS_SQL_TEMPLATE = '''
-WITH scheduler_jobs as (
-    SELECT id
-    FROM {table}
-    WHERE
-        {job_types}
-        (scheduler_locked_at IS NULL OR
-            ({now} > (scheduler_locked_at + INTERVAL '60 seconds'))) AND
-        status IN ({statuses})
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE {table} SET
-    scheduler_locked_at = {now}
-FROM scheduler_jobs
-WHERE {table}.id = scheduler_jobs.id
-RETURNING {table}.*;
-'''
-
 SCHEDULER_LOCK_SQL_TEMPLATE = '''
 WITH schedulables as (
     SELECT id
     FROM {table}
     WHERE
-        schedule_enabled = true AND
+        {enabled_column} = true AND
         schedule IS NOT NULL AND
         (scheduler_locked_at IS NULL OR
             ({now} > (scheduler_locked_at + INTERVAL '60 seconds')))
     FOR UPDATE SKIP LOCKED
 )
 UPDATE {table} SET
-    scheduler_locked_at = {now}
+    scheduler_locked_at = {now},
+    scheduler_lock_id = '{lock_id}'
 FROM schedulables
 WHERE {table}.id = schedulables.id
 RETURNING {table}.*;
 '''
 
-def run_update_sql(session,
-                   cls_self,
-                   sql_template,
-                   now=None,
-                   sql_params=None,
-                   additional_params=None):
+SCHEDULER_UNLOCK = '''
+UPDATE {table} SET
+    scheduler_locked_at = null,
+    scheduler_lock_id = null
+WHERE scheduler_lock_id = '{lock_id}'
+RETURNING {table}.*;
+'''
+
+def run_update_sql_prepare(
+    cls_self,
+    sql_template,
+    now,
+    sql_params,
+    additional_params):
     if not now:
         now_sql = 'NOW()'
     else:
@@ -138,6 +132,22 @@ def run_update_sql(session,
     else:
         cls = cls_self.__class__
 
+    return cls, sql_smt, sql_params
+
+def run_update_sql(
+    session,
+    cls_self,
+    sql_template,
+    now=None,
+    sql_params=None,
+    additional_params=None):
+    cls, sql_smt, sql_params = run_update_sql_prepare(
+        cls_self,
+        sql_template,
+        now,
+        sql_params,
+        additional_params)
+
     instances = (
         session
         .query(cls)
@@ -149,10 +159,35 @@ def run_update_sql(session,
 
     return instances
 
+async def run_update_sql_async(
+    session,
+    cls_self,
+    sql_template,
+    now=None,
+    sql_params=None,
+    additional_params=None):
+    cls, sql_smt, sql_params = run_update_sql_prepare(
+        cls_self,
+        sql_template,
+        now,
+        sql_params,
+        additional_params)
+
+    stmt = select(cls).from_statement(sa.text(sql_smt)).params(**sql_params)
+    result = await session.execute(stmt)
+    instances = []
+    for row in result.all():
+        instances.append(row[0])
+
+    return instances
+
 class Schedulable:
-    schedule_enabled = sa.Column(sa.Boolean, nullable=False)
+    __schedulable_instance_class__ = None
+    __schedulable_instance_fk__ = None
+    __job_type_column__ = None # string column
+    __enabled_column__ = None # boolean column
+
     schedule = sa.Column(sa.String)
-    job_type = sa.Column(sa.String)
     num_retries = sa.Column(sa.Integer, nullable=False, default=0)
     timeout = sa.Column(sa.Integer, nullable=False, default=3600)
     retry_delay = sa.Column(sa.Integer, nullable=False, default=600)
@@ -177,67 +212,242 @@ class Schedulable:
         return self.get_croniter(base_time).get_prev(datetime)
 
     @classmethod
-    def schedule_next_runs(cls,
-                           session,
-                           logger=None,
-                           schedulable_instance_class=None,
-                           schedulable_instance_fk=None,
-                           now=None):
+    def schedule_next_runs_prepare(cls,
+                                   schedulable_instance_class=None,
+                                   schedulable_instance_fk=None,
+                                   schedulable_instance_job_type=None):
         if not schedulable_instance_class:
             schedulable_instance_class = getattr(cls, '__schedulable_instance_class__')
         if not schedulable_instance_fk:
             schedulable_instance_fk = getattr(cls, '__schedulable_instance_fk__')
         schedulable_instance_fk_col = getattr(schedulable_instance_class, schedulable_instance_fk)
+        if not schedulable_instance_job_type:
+            schedulable_instance_job_type = getattr(schedulable_instance_class, '__job_type_column__')
+        schedulable_instance_job_type_col = getattr(schedulable_instance_class, schedulable_instance_job_type)
 
-        schedulables = run_update_sql(session, cls, SCHEDULER_LOCK_SQL_TEMPLATE, now)
+        return (
+            schedulable_instance_class,
+            schedulable_instance_fk,
+            schedulable_instance_fk_col,
+            schedulable_instance_job_type,
 
-        for schedulable in schedulables:
-            most_recent_instance = (
-                session
-                .query(schedulable_instance_class)
-                .filter(
-                    schedulable_instance_fk_col == schedulable.id,
-                    schedulable_instance_class.scheduled == True,
-                    schedulable_instance_class.status.notin_(['dequeued', 'success', 'failed'])
-                )
-                .order_by(schedulable_instance_class.run_at.desc())
-                .first()
+        )
+
+    @classmethod
+    def get_schedulables(cls, session, lock_id, now):
+        return run_update_sql(
+            session,
+            cls,
+            SCHEDULER_LOCK_SQL_TEMPLATE,
+            now,
+            additional_params={
+                'enabled_column': cls.__enabled_column__,
+                'lock_id': lock_id
+            })
+
+    @classmethod
+    async def get_schedulables_async(cls, session, lock_id, now):
+        return await run_update_sql_async(
+            session,
+            cls,
+            SCHEDULER_LOCK_SQL_TEMPLATE,
+            now,
+            additional_params={
+                'enabled_column': cls.__enabled_column__,
+                'lock_id': lock_id
+            })
+
+    @classmethod
+    def get_most_recent_instance(cls,
+                                 session,
+                                 schedulable,
+                                 schedulable_instance_class,
+                                 schedulable_instance_fk_col):
+        return (
+            session
+            .query(schedulable_instance_class)
+            .filter(
+                schedulable_instance_fk_col == schedulable.id,
+                schedulable_instance_class.scheduled == True,
+                schedulable_instance_class.status.notin_(['dequeued', 'success', 'failed'])
             )
+            .order_by(schedulable_instance_class.run_at.desc())
+            .first()
+        )
 
-            if not most_recent_instance:
-                run_at = schedulable.next_run(now)
+    @classmethod
+    async def get_most_recent_instance_async(cls,
+                                             session,
+                                             schedulable,
+                                             schedulable_instance_class,
+                                             schedulable_instance_fk_col):
+        stmt = (
+            select(schedulable_instance_class)
+            .filter(
+                schedulable_instance_fk_col == schedulable.id,
+                schedulable_instance_class.scheduled == True,
+                schedulable_instance_class.status.notin_(['dequeued', 'success', 'failed'])
+            )
+            .order_by(schedulable_instance_class.run_at.desc())
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        row = result.one_or_none()
 
-                if logger:
-                    logger.info('Scheduling next run for {} at {}'.format(
-                        cls.__name__,
-                        run_at.isoformat()))
+        if not row:
+            return None
 
-                instance_fields = {
-                    'scheduled': True,
-                    'run_at': run_at,
-                    'unique': 'scheduled:{}:{}'.format(
-                        schedulable.id,
-                        int(run_at.timestamp())),
-                    'max_attempts': schedulable.num_retries + 1,
-                    'priority': schedulable.priority,
-                    'timeout': schedulable.timeout,
-                    'retry_delay': schedulable.retry_delay,
-                    'job_type': schedulable.job_type
-                }
-                instance_fields[schedulable_instance_fk] = schedulable.id
+        return row[0]
 
-                new_instance = schedulable_instance_class(**instance_fields)
-                session.add(new_instance)
-                session.flush()
+    @classmethod
+    def make_instance_from_schedule(cls,
+                                    logger,
+                                    schedulable,
+                                    schedulable_instance_fk,
+                                    schedulable_instance_job_type,
+                                    schedulable_instance_class,
+                                    now):
+        run_at = schedulable.next_run(now)
+
+        if logger:
+            logger.info('Scheduling next run for {} at {}'.format(
+                cls.__name__,
+                run_at.isoformat()))
+
+        instance_fields = {
+            'scheduled': True,
+            'run_at': run_at,
+            'unique': 'scheduled:{}:{}'.format(
+                schedulable.id,
+                int(run_at.timestamp())),
+            'max_attempts': schedulable.num_retries + 1,
+            'priority': schedulable.priority,
+            'timeout': schedulable.timeout,
+            'retry_delay': schedulable.retry_delay
+        }
+        instance_fields[schedulable_instance_fk] = schedulable.id
+        job_type = getattr(schedulable, getattr(schedulable, '__job_type_column__'))
+        instance_fields[schedulable_instance_job_type] = job_type
+
+        if hasattr(cls, '__schedulable_extra_fields__'):
+            for cls_field, instance_field in getattr(cls, '__schedulable_extra_fields__').items():
+                instance_fields[instance_field] = getattr(schedulable, cls_field)
+
+        return schedulable_instance_class(**instance_fields)
+
+    @classmethod
+    def schedule_next_runs(cls,
+                           session,
+                           logger=None,
+                           schedulable_instance_class=None,
+                           schedulable_instance_fk=None,
+                           schedulable_instance_job_type=None,
+                           now=None):
+        schedulable_instance_class, schedulable_instance_fk,schedulable_instance_fk_col, schedulable_instance_job_type = cls.schedule_next_runs_prepare(
+            schedulable_instance_class,
+            schedulable_instance_fk,
+            schedulable_instance_job_type)
+
+        lock_id = str(uuid.uuid4())
+
+        schedulables = cls.get_schedulables(session, now)
 
         session.commit()
 
-## TODO: unique index
-## TODO: other indexes?
+        for schedulable in schedulables:
+            try:
+                most_recent_instance = cls.get_most_recent_instance(
+                    session,
+                    schedulable,
+                    schedulable_instance_class,
+                    schedulable_instance_fk_col)
+
+                if not most_recent_instance:
+                    new_instance = cls.make_instance_from_schedule(
+                        logger,
+                        schedulable,
+                        schedulable_instance_fk,
+                        schedulable_instance_job_type,
+                        schedulable_instance_class,
+                        now)
+                    
+                    session.add(new_instance)
+                    session.commit()
+            except:
+                ## TODO: use passed in logger
+                print('Exception scheduling instance: {}'.format(schedulable.id))
+                session.rollback()
+
+        if schedulables:
+            run_update_sql(
+                session,
+                cls,
+                SCHEDULER_UNLOCK,
+                now,
+                additional_params={
+                    'lock_id': lock_id
+                })
+            session.commit()
+
+    @classmethod
+    async def schedule_next_runs_async(cls,
+                                       session,
+                                       logger=None,
+                                       schedulable_instance_class=None,
+                                       schedulable_instance_fk=None,
+                                       schedulable_instance_job_type=None,
+                                       now=None):
+        schedulable_instance_class, schedulable_instance_fk,schedulable_instance_fk_col, schedulable_instance_job_type = cls.schedule_next_runs_prepare(
+            schedulable_instance_class,
+            schedulable_instance_fk,
+            schedulable_instance_job_type)
+
+        lock_id = str(uuid.uuid4())
+
+        schedulables = await cls.get_schedulables_async(session, lock_id, now)
+
+        await session.commit()
+
+        for schedulable in schedulables:
+            try:
+                most_recent_instance = await cls.get_most_recent_instance_async(
+                    session,
+                    schedulable,
+                    schedulable_instance_class,
+                    schedulable_instance_fk_col)
+
+                if not most_recent_instance:
+                    new_instance = cls.make_instance_from_schedule(
+                        logger,
+                        schedulable,
+                        schedulable_instance_fk,
+                        schedulable_instance_job_type,
+                        schedulable_instance_class,
+                        now)
+
+                    session.add(new_instance)
+                    await session.commit()
+            except:
+                ## TODO: use passed in logger
+                print('Exception scheduling instance: {}'.format(schedulable.id))
+                await session.rollback()
+
+        if schedulables:
+            await run_update_sql_async(
+                session,
+                cls,
+                SCHEDULER_UNLOCK,
+                now,
+                additional_params={
+                    'lock_id': lock_id
+                })
+            await session.commit()
+
 class SchedulableInstance:
+    __job_type_column__ = None # string column
+
     scheduled = sa.Column(sa.Boolean, nullable=False, default=False)
-    job_type = sa.Column(sa.String)
-    run_at = sa.Column(sa.DateTime, nullable=False, default=datetime.utcnow)
+    run_at = sa.Column(sa.DateTime, nullable=False, index=True, default=datetime.utcnow)
     started_at = sa.Column(sa.DateTime)
     ended_at = sa.Column(sa.DateTime)
     status = sa.Column(sa.Enum('queued',
@@ -274,6 +484,14 @@ class SchedulableInstance:
         run_update_sql(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
         session.refresh(self)
 
+    async def lock_async(self, session, worker_id, now=None):
+        sql_params = {
+            'id': self.id,
+            'worker_id': worker_id
+        }
+        await run_update_sql_async(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
+        await session.refresh(self)
+
     def touch(self, session, now=None):
         sql_params = {
             'id': self.id
@@ -281,23 +499,29 @@ class SchedulableInstance:
         run_update_sql(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
         session.refresh(self)
 
-    def complete(self, session, status):
+    async def touch_async(self, session, now=None):
+        sql_params = {
+            'id': self.id
+        }
+        await run_update_sql_async(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
+        await session.refresh(self)
+
+    def complete(self, status):
         self.status = status
         self.ended_at = datetime.utcnow()
-        session.commit()
 
-    def succeed(self, session):
-        self.complete(session, 'success')
+    def succeed(self):
+        self.complete('success')
 
-    def fail(self, session):
-        self.complete(session, 'failed')
+    def fail(self):
+        self.complete('failed')
 
     @classmethod
-    def next_jobs(cls,
-                  session,
-                  job_types=None,
-                  now=None,
-                  max_jobs=1):
+    def next_jobs_prepare(cls,
+                          session,
+                          job_types,
+                          now,
+                          max_jobs):
         additional_params = {}
         if job_types:
             additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
@@ -309,9 +533,59 @@ class SchedulableInstance:
             'max_jobs': max_jobs
         }
 
+        return sql_params, additional_params
+
+    @classmethod
+    def next_jobs(cls,
+                  session,
+                  job_types=None,
+                  now=None,
+                  max_jobs=1):
+        sql_params, additional_params = cls.next_jobs_prepare(
+            cls,
+            session,
+            job_types,
+            now,
+            max_jobs)
+
         return run_update_sql(session,
                               cls,
                               NEXT_JOBS_SQL_TEMPLATE,
                               now,
                               sql_params,
                               additional_params)
+
+    @classmethod
+    async def next_jobs_async(cls,
+                              session,
+                              job_types=None,
+                              now=None,
+                              max_jobs=1):
+        sql_params, additional_params = cls.next_jobs_prepare(
+            cls,
+            session,
+            job_types,
+            now,
+            max_jobs)
+
+        return await run_update_sql_async(
+            session,
+            cls,
+            NEXT_JOBS_SQL_TEMPLATE,
+            now,
+            sql_params,
+            additional_params)
+
+    @declared_attr
+    def __table_args__(cls):
+        index_name = 'idx_{}_unique_job'.format(cls.__tablename__)
+        extra_unique_columns = getattr(cls, '__extra_unique_columns__', [])
+        columns = extra_unique_columns + [cls.unique]
+
+        return (
+            sa.Index(index_name,
+                     *columns,
+                     unique=True,
+                     postgresql_where=cls.status.in_(
+                        ['queued', 'pushed', 'running', 'retry'])),
+        )

@@ -8,8 +8,7 @@ setup(
     version='0.0.1',
     packages=find_packages(),
     install_requires=[
-        'croniter==0.3.29',
-        'SQLAlchemy>=1.2.16'
+        'croniter==0.3.29'
     ],
     extras_require={
     },
