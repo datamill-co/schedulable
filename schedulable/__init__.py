@@ -542,7 +542,6 @@ class SchedulableInstance:
                   now=None,
                   max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
-            cls,
             session,
             job_types,
             now,
@@ -562,7 +561,6 @@ class SchedulableInstance:
                               now=None,
                               max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
-            cls,
             session,
             job_types,
             now,
