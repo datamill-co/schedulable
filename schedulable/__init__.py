@@ -5,6 +5,7 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.orm import declared_attr
 from sqlalchemy.future import select
+from sqlalchemy.dialects.postgresql import UUID
 from croniter import croniter
 
 NEXT_JOBS_SQL_TEMPLATE = '''
@@ -14,12 +15,12 @@ WITH next_jobs as (
     WHERE
         {job_types}
         (scheduler_locked_at IS NULL OR
-            ({now} > (scheduler_locked_at + INTERVAL '60 seconds'))) AND
+            ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
         run_at <= {now} AND
         attempts < max_attempts AND
         (status = 'queued' OR
-          (status = 'running' AND ({now} > (worker_locked_at + INTERVAL '1 second' * timeout))) OR
-          (status = 'retry' AND ({now} > (worker_locked_at + INTERVAL '1 second' * retry_delay))))
+          (status = 'running' AND ((worker_locked_at + INTERVAL '1 second' * timeout) < {now})) OR
+          (status = 'retry' AND ((worker_locked_at + INTERVAL '1 second' * retry_delay) < {now})))
     ORDER BY
         CASE WHEN priority = 'critical'
              THEN 1
@@ -35,7 +36,8 @@ WITH next_jobs as (
     FOR UPDATE SKIP LOCKED
 )
 UPDATE {table} SET
-    scheduler_locked_at = {now}
+    scheduler_locked_at = {now},
+    scheduler_lock_id = '{lock_id}'
 FROM next_jobs
 WHERE {table}.id = next_jobs.id
 RETURNING {table}.*;
@@ -86,7 +88,7 @@ WITH schedulables as (
         {enabled_column} = true AND
         schedule IS NOT NULL AND
         (scheduler_locked_at IS NULL OR
-            ({now} > (scheduler_locked_at + INTERVAL '60 seconds')))
+            ((scheduler_locked_at + INTERVAL '60 seconds') < {now}))
     FOR UPDATE SKIP LOCKED
 )
 UPDATE {table} SET
@@ -181,7 +183,36 @@ async def run_update_sql_async(
 
     return instances
 
-class Schedulable:
+class SchedulerUnlockMixin:
+    @classmethod
+    def scheduler_unlock(cls,
+                         session,
+                         lock_id,
+                         now=None):
+        run_update_sql(
+            session,
+            cls,
+            SCHEDULER_UNLOCK,
+            now,
+            additional_params={
+                'lock_id': lock_id
+            })
+
+    @classmethod
+    async def scheduler_unlock_async(cls,
+                                     session,
+                                     lock_id,
+                                     now=None):
+        await run_update_sql_async(
+            session,
+            cls,
+            SCHEDULER_UNLOCK,
+            now,
+            additional_params={
+                'lock_id': lock_id
+            })
+
+class Schedulable(SchedulerUnlockMixin):
     __schedulable_instance_class__ = None
     __schedulable_instance_fk__ = None
     __job_type_column__ = None # string column
@@ -199,6 +230,7 @@ class Schedulable:
                          nullable=False,
                          default='normal')
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
+    scheduler_lock_id = sa.Column(UUID, index=True)
 
     def get_croniter(self, base_time=None):
         if not base_time:
@@ -374,19 +406,15 @@ class Schedulable:
                     session.add(new_instance)
                     session.commit()
             except:
-                ## TODO: use passed in logger
-                print('Exception scheduling instance: {}'.format(schedulable.id))
+                if logger:
+                    logger.exception('Exception scheduling instance: {}'.format(schedulable.id))
                 session.rollback()
 
         if schedulables:
-            run_update_sql(
+            cls.scheduler_unlock(
                 session,
-                cls,
-                SCHEDULER_UNLOCK,
-                now,
-                additional_params={
-                    'lock_id': lock_id
-                })
+                lock_id,
+                now)
             session.commit()
 
     @classmethod
@@ -428,22 +456,18 @@ class Schedulable:
                     session.add(new_instance)
                     await session.commit()
             except:
-                ## TODO: use passed in logger
-                print('Exception scheduling instance: {}'.format(schedulable.id))
+                if logger:
+                    logger.exception('Exception scheduling instance: {}'.format(schedulable.id))
                 await session.rollback()
 
         if schedulables:
-            await run_update_sql_async(
+            await cls.scheduler_unlock_async(
                 session,
-                cls,
-                SCHEDULER_UNLOCK,
-                now,
-                additional_params={
-                    'lock_id': lock_id
-                })
+                lock_id,
+                now)
             await session.commit()
 
-class SchedulableInstance:
+class SchedulableInstance(SchedulerUnlockMixin):
     __job_type_column__ = None # string column
 
     scheduled = sa.Column(sa.Boolean, nullable=False, default=False)
@@ -469,6 +493,7 @@ class SchedulableInstance:
                          default='normal')
     unique = sa.Column(sa.String)
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
+    scheduler_lock_id = sa.Column(UUID, index=True)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
     worker_id = sa.Column(sa.Text)
     attempts = sa.Column(sa.Integer, nullable=False, default=0)
@@ -519,10 +544,13 @@ class SchedulableInstance:
     @classmethod
     def next_jobs_prepare(cls,
                           session,
+                          lock_id,
                           job_types,
                           now,
                           max_jobs):
-        additional_params = {}
+        additional_params = {
+            'lock_id': lock_id
+        }
         if job_types:
             additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
                 "','".join(job_types))
@@ -538,11 +566,13 @@ class SchedulableInstance:
     @classmethod
     def next_jobs(cls,
                   session,
+                  lock_id,
                   job_types=None,
                   now=None,
                   max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
             session,
+            lock_id,
             job_types,
             now,
             max_jobs)
@@ -557,11 +587,13 @@ class SchedulableInstance:
     @classmethod
     async def next_jobs_async(cls,
                               session,
+                              lock_id,
                               job_types=None,
                               now=None,
                               max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
             session,
+            lock_id,
             job_types,
             now,
             max_jobs)
