@@ -436,6 +436,7 @@ class Schedulable(SchedulerUnlockMixin):
 
         await session.commit()
 
+        jobs_scheduled = 0
         for schedulable in schedulables:
             try:
                 most_recent_instance = await cls.get_most_recent_instance_async(
@@ -455,6 +456,8 @@ class Schedulable(SchedulerUnlockMixin):
 
                     session.add(new_instance)
                     await session.commit()
+
+                    jobs_scheduled += 1
             except:
                 if logger:
                     logger.exception('Exception scheduling instance: {}'.format(schedulable.id))
@@ -466,6 +469,8 @@ class Schedulable(SchedulerUnlockMixin):
                 lock_id,
                 now)
             await session.commit()
+
+        return jobs_scheduled
 
 class SchedulableInstance(SchedulerUnlockMixin):
     __job_type_column__ = None # string column
