@@ -49,6 +49,7 @@ with worker_job as (
     FROM {table}
     WHERE
         id = :id AND
+        worker_id IS NULL AND
         worker_locked_at IS NULL
     LIMIT 1
     FOR UPDATE
@@ -58,6 +59,7 @@ UPDATE {table} SET
     worker_id = :worker_id,
     worker_locked_at = {now},
     started_at = COALESCE(worker_job.started_at, {now}),
+    ended_at = NULL,
     attempts = attempts + 1
 FROM worker_job
 WHERE {table}.id = worker_job.id
@@ -69,7 +71,8 @@ with worker_job as (
     SELECT id
     FROM {table}
     WHERE
-        id = :id
+        id = :id AND
+        worker_id = :worker_id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
@@ -512,6 +515,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
             'worker_id': worker_id
         }
         run_update_sql(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
+        session.commit()
         session.refresh(self)
 
     async def lock_async(self, session, worker_id, now=None):
@@ -520,20 +524,25 @@ class SchedulableInstance(SchedulerUnlockMixin):
             'worker_id': worker_id
         }
         await run_update_sql_async(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
+        await session.commit()
         await session.refresh(self)
 
-    def touch(self, session, now=None):
+    def touch(self, session, worker_id, now=None):
         sql_params = {
-            'id': self.id
+            'id': self.id,
+            'worker_id': worker_id
         }
         run_update_sql(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
+        session.commit()
         session.refresh(self)
 
-    async def touch_async(self, session, now=None):
+    async def touch_async(self, session, worker_id, now=None):
         sql_params = {
-            'id': self.id
+            'id': self.id,
+            'worker_id': worker_id
         }
         await run_update_sql_async(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
+        await session.commit()
         await session.refresh(self)
 
     def complete(self, status):
