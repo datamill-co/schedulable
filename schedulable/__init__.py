@@ -48,9 +48,12 @@ with worker_job as (
     SELECT id, started_at
     FROM {table}
     WHERE
-        id = :id AND
-        worker_id IS NULL AND
-        worker_locked_at IS NULL
+        id = :id AND (
+            (worker_id IS NULL AND
+             worker_locked_at IS NULL) OR
+            worker_id = :worker_id OR
+            (worker_locked_at + INTERVAL '1 second' * timeout) < now()
+        )
     LIMIT 1
     FOR UPDATE
 )
