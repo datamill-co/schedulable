@@ -43,6 +43,30 @@ WHERE {table}.id = next_jobs.id
 RETURNING {table}.*;
 '''
 
+TIMEOUT_JOBS = '''
+WITH next_jobs as (
+    SELECT id
+    FROM {table}
+    WHERE
+        {job_types}
+        (scheduler_locked_at IS NULL OR
+            ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
+        attempts >= max_attempts AND
+        status = 'running' AND
+        (worker_locked_at + INTERVAL '1 second' * timeout) < {now}
+    LIMIT :max_jobs
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE {table} SET
+    status = 'failed',
+    worker_id = NULL,
+    worker_locked_at = NULL,
+    ended_at = {now}
+FROM next_jobs
+WHERE {table}.id = next_jobs.id
+RETURNING {table}.*;
+'''
+
 JOB_LOCK_SQL_TEMPLATE = '''
 with worker_job as (
     SELECT id, started_at
@@ -560,10 +584,8 @@ class SchedulableInstance(SchedulerUnlockMixin):
 
     @classmethod
     def next_jobs_prepare(cls,
-                          session,
                           lock_id,
                           job_types,
-                          now,
                           max_jobs):
         additional_params = {
             'lock_id': lock_id
@@ -588,10 +610,8 @@ class SchedulableInstance(SchedulerUnlockMixin):
                   now=None,
                   max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
-            session,
             lock_id,
             job_types,
-            now,
             max_jobs)
 
         return run_update_sql(session,
@@ -609,16 +629,66 @@ class SchedulableInstance(SchedulerUnlockMixin):
                               now=None,
                               max_jobs=1):
         sql_params, additional_params = cls.next_jobs_prepare(
-            session,
             lock_id,
             job_types,
-            now,
             max_jobs)
 
         return await run_update_sql_async(
             session,
             cls,
             NEXT_JOBS_SQL_TEMPLATE,
+            now,
+            sql_params,
+            additional_params)
+
+    @classmethod
+    def timeout_jobs_prepare(cls,
+                             job_types,
+                             max_jobs):
+        additional_params = {}
+        if job_types:
+            additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
+                "','".join(job_types))
+        else:
+            additional_params['job_types'] = ''
+
+        sql_params = {
+            'max_jobs': max_jobs
+        }
+
+        return sql_params, additional_params
+
+    @classmethod
+    def timeout_jobs(cls,
+                     session,
+                     job_types=None,
+                     now=None,
+                     max_jobs=1):
+        sql_params, additional_params = cls.timeout_jobs_prepare(
+            job_types,
+            max_jobs)
+
+        return run_update_sql(session,
+                              cls,
+                              TIMEOUT_JOBS,
+                              now,
+                              sql_params,
+                              additional_params)
+
+    @classmethod
+    async def timeout_jobs_async(cls,
+                                 session,
+                                 job_types=None,
+                                 now=None,
+                                 max_jobs=1):
+        sql_params, additional_params = cls.timeout_jobs_prepare(
+            job_types,
+            max_jobs)
+
+        return await run_update_sql_async(
+            session,
+            cls,
+            TIMEOUT_JOBS,
             now,
             sql_params,
             additional_params)
