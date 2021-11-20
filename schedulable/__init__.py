@@ -72,9 +72,14 @@ with worker_job as (
     SELECT id, started_at
     FROM {table}
     WHERE
-        id = :id AND (
+        id = :id AND
+        (
+            scheduler_locked_at IS NULL OR
+                ((scheduler_locked_at + INTERVAL '60 seconds') < {now})
+        ) AND
+        (
             (worker_id IS NULL AND
-             worker_locked_at IS NULL) OR
+                worker_locked_at IS NULL) OR
             worker_id = :worker_id OR
             (worker_locked_at + INTERVAL '1 second' * timeout) < now()
         )
@@ -85,6 +90,8 @@ UPDATE {table} SET
     status = 'running',
     worker_id = :worker_id,
     worker_locked_at = {now},
+    scheduler_lock_id = null,
+    scheduler_locked_at = null,
     started_at = COALESCE(worker_job.started_at, {now}),
     ended_at = NULL,
     attempts = attempts + 1
