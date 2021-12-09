@@ -49,11 +49,11 @@ WITH next_jobs as (
     FROM {table}
     WHERE
         {job_types}
+        status = 'running' AND
         (scheduler_locked_at IS NULL OR
             ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
-        attempts >= max_attempts AND
-        status = 'running' AND
-        (worker_locked_at + INTERVAL '1 second' * timeout) < {now}
+        (worker_locked_at IS NULL OR
+            ((worker_locked_at + INTERVAL '1 second' * timeout) < {now}))
     LIMIT :max_jobs
     FOR UPDATE SKIP LOCKED
 )
@@ -62,6 +62,30 @@ UPDATE {table} SET
     worker_id = NULL,
     worker_locked_at = NULL,
     ended_at = {now}
+FROM next_jobs
+WHERE {table}.id = next_jobs.id
+RETURNING {table}.*;
+'''
+
+TIMEOUT_PUSHED = '''
+WITH next_jobs as (
+    SELECT id
+    FROM {table}
+    WHERE
+        {job_types}
+        status = 'pushed' AND
+        (pushed_at + INTERVAL '600 seconds') < {now} AND
+        (scheduler_locked_at IS NULL OR
+            ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
+        (worker_locked_at IS NULL OR
+            ((worker_locked_at + INTERVAL '1 second' * timeout) < {now}))
+    LIMIT :max_jobs
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE {table} SET
+    status = 'failed',
+    worker_id = NULL,
+    worker_locked_at = NULL
 FROM next_jobs
 WHERE {table}.id = next_jobs.id
 RETURNING {table}.*;
@@ -536,6 +560,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
     unique = sa.Column(sa.String)
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
     scheduler_lock_id = sa.Column(UUID, index=True)
+    pushed_at = sa.Column(sa.DateTime)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
     worker_id = sa.Column(sa.Text)
     attempts = sa.Column(sa.Integer, nullable=False, default=0)
@@ -580,8 +605,13 @@ class SchedulableInstance(SchedulerUnlockMixin):
         await session.refresh(self)
 
     def complete(self, status):
-        self.status = status
-        self.ended_at = datetime.utcnow()
+        if status == 'failed' and self.attempts < self.max_attempts:
+            self.status = 'retry'
+        else:
+            self.status = status
+            self.ended_at = datetime.utcnow()
+        self.worker_id = None
+        self.worker_locked_at = None
 
     def succeed(self):
         self.complete('success')
@@ -696,6 +726,58 @@ class SchedulableInstance(SchedulerUnlockMixin):
             session,
             cls,
             TIMEOUT_JOBS,
+            now,
+            sql_params,
+            additional_params)
+
+    @classmethod
+    def timeout_pushed_prepare(cls,
+                             job_types,
+                             max_jobs):
+        additional_params = {}
+        if job_types:
+            additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
+                "','".join(job_types))
+        else:
+            additional_params['job_types'] = ''
+
+        sql_params = {
+            'max_jobs': max_jobs
+        }
+
+        return sql_params, additional_params
+
+    @classmethod
+    def timeout_pushed(cls,
+                     session,
+                     job_types=None,
+                     now=None,
+                     max_jobs=1):
+        sql_params, additional_params = cls.timeout_pushed_prepare(
+            job_types,
+            max_jobs)
+
+        return run_update_sql(session,
+                              cls,
+                              TIMEOUT_PUSHED,
+                              now,
+                              sql_params,
+                              additional_params)
+
+    @classmethod
+    async def timeout_pushed_async(cls,
+                                 session,
+                                 job_types=None,
+                                 now=None,
+                                 max_jobs=1):
+        sql_params, additional_params = cls.timeout_pushed_prepare(
+            job_types,
+            max_jobs)
+
+        return await run_update_sql_async(
+            session,
+            cls,
+            TIMEOUT_PUSHED,
             now,
             sql_params,
             additional_params)
