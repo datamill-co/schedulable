@@ -20,7 +20,7 @@ WITH next_jobs as (
         attempts < max_attempts AND
         (status = 'queued' OR
           (status = 'running' AND ((worker_locked_at + INTERVAL '1 second' * timeout) < {now})) OR
-          (status = 'retry' AND ((worker_locked_at + INTERVAL '1 second' * retry_delay) < {now})))
+          (status = 'retry' AND ((status_last_changed_at + INTERVAL '1 second' * retry_delay) < {now})))
     ORDER BY
         CASE WHEN priority = 'critical'
              THEN 1
@@ -59,6 +59,7 @@ WITH next_jobs as (
 )
 UPDATE {table} SET
     status = 'failed',
+    status_last_changed_at = {now},
     worker_id = NULL,
     worker_locked_at = NULL,
     ended_at = {now}
@@ -74,7 +75,7 @@ WITH next_jobs as (
     WHERE
         {job_types}
         status = 'pushed' AND
-        (pushed_at + INTERVAL '600 seconds') < {now} AND
+        (status_last_changed_at + INTERVAL '600 seconds') < {now} AND
         (scheduler_locked_at IS NULL OR
             ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
         (worker_locked_at IS NULL OR
@@ -84,6 +85,7 @@ WITH next_jobs as (
 )
 UPDATE {table} SET
     status = 'failed',
+    status_last_changed_at = {now},
     worker_id = NULL,
     worker_locked_at = NULL
 FROM next_jobs
@@ -112,6 +114,7 @@ with worker_job as (
 )
 UPDATE {table} SET
     status = 'running',
+    status_last_changed_at = {now},
     worker_id = :worker_id,
     worker_locked_at = {now},
     scheduler_lock_id = null,
@@ -550,6 +553,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
                                name='schedulable_statuses'),
                        nullable=False,
                        default='queued')
+    status_last_changed_at = sa.Column(sa.DateTime)
     priority = sa.Column(sa.Enum('critical',
                                  'high',
                                  'normal',
@@ -560,7 +564,6 @@ class SchedulableInstance(SchedulerUnlockMixin):
     unique = sa.Column(sa.String)
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
     scheduler_lock_id = sa.Column(UUID, index=True)
-    pushed_at = sa.Column(sa.DateTime)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
     worker_id = sa.Column(sa.Text)
     attempts = sa.Column(sa.Integer, nullable=False, default=0)
@@ -610,6 +613,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
         else:
             self.status = status
             self.ended_at = datetime.utcnow()
+        self.status_last_changed_at = datetime.utcnow()
         self.worker_id = None
         self.worker_locked_at = None
 
