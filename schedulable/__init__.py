@@ -99,6 +99,7 @@ with worker_job as (
     FROM {table}
     WHERE
         id = :id AND
+        attempts < max_attempts AND
         (
             scheduler_locked_at IS NULL OR
                 ((scheduler_locked_at + INTERVAL '60 seconds') < {now})
@@ -115,6 +116,7 @@ with worker_job as (
 UPDATE {table} SET
     status = 'running',
     status_last_changed_at = {now},
+    worker_lock_id = {worker_lock_id},
     worker_id = :worker_id,
     worker_locked_at = {now},
     scheduler_lock_id = null,
@@ -133,7 +135,7 @@ with worker_job as (
     FROM {table}
     WHERE
         id = :id AND
-        worker_id = :worker_id
+        worker_lock_id = :worker_lock_id
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
@@ -170,6 +172,12 @@ UPDATE {table} SET
 WHERE scheduler_lock_id = '{lock_id}'
 RETURNING {table}.*;
 '''
+
+class CouldNotLockResourceException(Exception):
+    pass
+
+class ResourceLockedByLockIDException(Exception):
+    pass
 
 def run_update_sql_prepare(
     cls_self,
@@ -566,46 +574,81 @@ class SchedulableInstance(SchedulerUnlockMixin):
     scheduler_lock_id = sa.Column(UUID, index=True)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
     worker_id = sa.Column(sa.Text)
+    worker_lock_id = sa.Column(UUID)
     attempts = sa.Column(sa.Integer, nullable=False, default=0)
     max_attempts = sa.Column(sa.Integer, nullable=False, default=1)
     timeout = sa.Column(sa.Integer, nullable=False)
     retry_delay = sa.Column(sa.Integer, nullable=False)
 
-    def lock(self, session, worker_id, now=None):
+    def lock(self, session, worker_id, worker_lock_id=None, now=None):
+        if worker_lock_id is None:
+            worker_lock_id = uuid.uuid4()
+
         sql_params = {
             'id': self.id,
-            'worker_id': worker_id
+            'worker_id': worker_id,
+            'worker_lock_id': worker_lock_id
         }
+
         run_update_sql(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
         session.commit()
         session.refresh(self)
 
-    async def lock_async(self, session, worker_id, now=None):
+        if self.worker_lock_id != worker_lock_id:
+            raise CouldNotLockResourceException()
+
+        return worker_lock_id
+
+    async def lock_async(self, session, worker_id, worker_lock_id=None, now=None):
+        if worker_lock_id is None:
+            worker_lock_id = uuid.uuid4()
+
         sql_params = {
             'id': self.id,
-            'worker_id': worker_id
+            'worker_id': worker_id,
+            'worker_lock_id': worker_lock_id
         }
+
         await run_update_sql_async(session, self, JOB_LOCK_SQL_TEMPLATE, now, sql_params)
         await session.commit()
         await session.refresh(self)
 
-    def touch(self, session, worker_id, now=None):
+        if self.worker_lock_id != worker_lock_id:
+            raise ResourceLockedByLockIDException()
+
+        return worker_lock_id
+
+    def touch(self, session, worker_lock_id=None, now=None):
+        if not worker_lock_id:
+            worker_lock_id = self.worker_lock_id
+
         sql_params = {
             'id': self.id,
-            'worker_id': worker_id
+            'worker_lock_id': worker_lock_id
         }
+
         run_update_sql(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
         session.commit()
         session.refresh(self)
 
-    async def touch_async(self, session, worker_id, now=None):
+        if self.worker_lock_id != worker_lock_id:
+            raise ResourceLockedByLockIDException()
+
+    async def touch_async(self, session, now=None):
+        if not worker_lock_id:
+            worker_lock_id = self.worker_lock_id
+
         sql_params = {
             'id': self.id,
-            'worker_id': worker_id
+            'worker_lock_id': worker_lock_id
         }
+
         await run_update_sql_async(session, self, JOB_TOUCH_SQL_TEMPLATE, now, sql_params)
         await session.commit()
         await session.refresh(self)
+
+        if self.worker_lock_id != worker_lock_id:
+            raise ResourceLockedByLockIDException()
 
     def complete(self, status):
         if status == 'failed' and self.attempts < self.max_attempts:
@@ -614,6 +657,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
             self.status = status
             self.ended_at = datetime.utcnow()
         self.status_last_changed_at = datetime.utcnow()
+        self.worker_lock_id = None
         self.worker_id = None
         self.worker_locked_at = None
 
