@@ -61,6 +61,7 @@ UPDATE {table} SET
     status = 'failed',
     status_last_changed_at = {now},
     worker_id = NULL,
+    worker_lock_id = NULL,
     worker_locked_at = NULL,
     ended_at = {now}
 FROM next_jobs
@@ -105,9 +106,9 @@ with worker_job as (
                 ((scheduler_locked_at + INTERVAL '60 seconds') < {now})
         ) AND
         (
-            (worker_id IS NULL AND
+            (worker_lock_id IS NULL AND
                 worker_locked_at IS NULL) OR
-            worker_id = :worker_id OR
+            worker_lock_id = :worker_lock_id OR
             (worker_locked_at + INTERVAL '1 second' * timeout) < now()
         )
     LIMIT 1
@@ -116,7 +117,7 @@ with worker_job as (
 UPDATE {table} SET
     status = 'running',
     status_last_changed_at = {now},
-    worker_lock_id = {worker_lock_id},
+    worker_lock_id = :worker_lock_id,
     worker_id = :worker_id,
     worker_locked_at = {now},
     scheduler_lock_id = null,
@@ -302,7 +303,7 @@ class Schedulable(SchedulerUnlockMixin):
                          nullable=False,
                          default='normal')
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
-    scheduler_lock_id = sa.Column(UUID, index=True)
+    scheduler_lock_id = sa.Column(UUID(as_uuid=True), index=True)
 
     def get_croniter(self, base_time=None):
         if not base_time:
@@ -433,6 +434,10 @@ class Schedulable(SchedulerUnlockMixin):
         job_type = getattr(schedulable, getattr(schedulable, '__job_type_column__'))
         instance_fields[schedulable_instance_job_type] = job_type
 
+        if hasattr(cls, '__schedulable_constant_fields__'):
+            for instance_field, value in getattr(cls, '__schedulable_constant_fields__').items():
+                instance_fields[instance_field] = value
+
         if hasattr(cls, '__schedulable_extra_fields__'):
             for cls_field, instance_field in getattr(cls, '__schedulable_extra_fields__').items():
                 instance_fields[instance_field] = getattr(schedulable, cls_field)
@@ -497,7 +502,7 @@ class Schedulable(SchedulerUnlockMixin):
                                        schedulable_instance_fk=None,
                                        schedulable_instance_job_type=None,
                                        now=None):
-        schedulable_instance_class, schedulable_instance_fk,schedulable_instance_fk_col, schedulable_instance_job_type = cls.schedule_next_runs_prepare(
+        schedulable_instance_class, schedulable_instance_fk, schedulable_instance_fk_col, schedulable_instance_job_type = cls.schedule_next_runs_prepare(
             schedulable_instance_class,
             schedulable_instance_fk,
             schedulable_instance_job_type)
@@ -561,7 +566,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
                                name='schedulable_statuses'),
                        nullable=False,
                        default='queued')
-    status_last_changed_at = sa.Column(sa.DateTime)
+    status_last_changed_at = sa.Column(sa.DateTime, default=datetime.utcnow)
     priority = sa.Column(sa.Enum('critical',
                                  'high',
                                  'normal',
@@ -571,10 +576,10 @@ class SchedulableInstance(SchedulerUnlockMixin):
                          default='normal')
     unique = sa.Column(sa.String)
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
-    scheduler_lock_id = sa.Column(UUID, index=True)
+    scheduler_lock_id = sa.Column(UUID(as_uuid=True), index=True)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
     worker_id = sa.Column(sa.Text)
-    worker_lock_id = sa.Column(UUID)
+    worker_lock_id = sa.Column(UUID(as_uuid=True))
     attempts = sa.Column(sa.Integer, nullable=False, default=0)
     max_attempts = sa.Column(sa.Integer, nullable=False, default=1)
     timeout = sa.Column(sa.Integer, nullable=False)
@@ -582,7 +587,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
 
     def lock(self, session, worker_id, worker_lock_id=None, now=None):
         if worker_lock_id is None:
-            worker_lock_id = uuid.uuid4()
+            worker_lock_id = str(uuid.uuid4())
 
         sql_params = {
             'id': self.id,
@@ -594,14 +599,14 @@ class SchedulableInstance(SchedulerUnlockMixin):
         session.commit()
         session.refresh(self)
 
-        if self.worker_lock_id != worker_lock_id:
+        if str(self.worker_lock_id) != worker_lock_id:
             raise CouldNotLockResourceException()
 
         return worker_lock_id
 
     async def lock_async(self, session, worker_id, worker_lock_id=None, now=None):
         if worker_lock_id is None:
-            worker_lock_id = uuid.uuid4()
+            worker_lock_id = str(uuid.uuid4())
 
         sql_params = {
             'id': self.id,
@@ -613,15 +618,12 @@ class SchedulableInstance(SchedulerUnlockMixin):
         await session.commit()
         await session.refresh(self)
 
-        if self.worker_lock_id != worker_lock_id:
-            raise ResourceLockedByLockIDException()
+        if str(self.worker_lock_id) != worker_lock_id:
+            raise CouldNotLockResourceException()
 
         return worker_lock_id
 
-    def touch(self, session, worker_lock_id=None, now=None):
-        if not worker_lock_id:
-            worker_lock_id = self.worker_lock_id
-
+    def touch(self, session, worker_lock_id, now=None):
         sql_params = {
             'id': self.id,
             'worker_lock_id': worker_lock_id
@@ -631,13 +633,10 @@ class SchedulableInstance(SchedulerUnlockMixin):
         session.commit()
         session.refresh(self)
 
-        if self.worker_lock_id != worker_lock_id:
+        if str(self.worker_lock_id) != str(worker_lock_id):
             raise ResourceLockedByLockIDException()
 
-    async def touch_async(self, session, now=None):
-        if not worker_lock_id:
-            worker_lock_id = self.worker_lock_id
-
+    async def touch_async(self, session, worker_lock_id, now=None):
         sql_params = {
             'id': self.id,
             'worker_lock_id': worker_lock_id
@@ -647,8 +646,17 @@ class SchedulableInstance(SchedulerUnlockMixin):
         await session.commit()
         await session.refresh(self)
 
-        if self.worker_lock_id != worker_lock_id:
+        if str(self.worker_lock_id) != str(worker_lock_id):
             raise ResourceLockedByLockIDException()
+
+    def release(self, complete=False):
+        if not complete:
+            self.status = 'queued'
+            self.attempts -= 1
+        self.status_last_changed_at = datetime.utcnow()
+        self.worker_lock_id = None
+        self.worker_id = None
+        self.worker_locked_at = None
 
     def complete(self, status):
         if status == 'failed' and self.attempts < self.max_attempts:
@@ -656,10 +664,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
         else:
             self.status = status
             self.ended_at = datetime.utcnow()
-        self.status_last_changed_at = datetime.utcnow()
-        self.worker_lock_id = None
-        self.worker_id = None
-        self.worker_locked_at = None
+        self.release(complete=True)
 
     def succeed(self):
         self.complete('success')
