@@ -50,6 +50,7 @@ WITH next_jobs as (
     WHERE
         {job_types}
         status = 'running' AND
+        attempts >= max_attempts AND
         (scheduler_locked_at IS NULL OR
             ((scheduler_locked_at + INTERVAL '60 seconds') < {now})) AND
         (worker_locked_at IS NULL OR
@@ -328,7 +329,6 @@ class Schedulable(SchedulerUnlockMixin):
         schedulable_instance_fk_col = getattr(schedulable_instance_class, schedulable_instance_fk)
         if not schedulable_instance_job_type:
             schedulable_instance_job_type = getattr(schedulable_instance_class, '__job_type_column__')
-        schedulable_instance_job_type_col = getattr(schedulable_instance_class, schedulable_instance_job_type)
 
         return (
             schedulable_instance_class,
@@ -422,17 +422,23 @@ class Schedulable(SchedulerUnlockMixin):
         instance_fields = {
             'scheduled': True,
             'run_at': run_at,
-            'unique': 'scheduled:{}:{}'.format(
-                schedulable.id,
-                int(run_at.timestamp())),
             'max_attempts': schedulable.num_retries + 1,
             'priority': schedulable.priority,
             'timeout': schedulable.timeout,
             'retry_delay': schedulable.retry_delay
         }
+
+        unique_col = getattr(schedulable_instance_class, '__unique_column__', None)
+        if unique_col:
+            instance_fields[unique_col] = 'scheduled:{}:{}'.format(
+                schedulable.id,
+                int(run_at.timestamp()))
+
         instance_fields[schedulable_instance_fk] = schedulable.id
-        job_type = getattr(schedulable, getattr(schedulable, '__job_type_column__'))
-        instance_fields[schedulable_instance_job_type] = job_type
+        job_type_col = getattr(schedulable, '__job_type_column__', None)
+        if job_type_col:
+            job_type = getattr(schedulable, job_type_col)
+            instance_fields[schedulable_instance_job_type] = job_type
 
         if hasattr(cls, '__schedulable_constant_fields__'):
             for instance_field, value in getattr(cls, '__schedulable_constant_fields__').items():
@@ -574,7 +580,6 @@ class SchedulableInstance(SchedulerUnlockMixin):
                                  name='schedulable_priorities'),
                          nullable=False,
                          default='normal')
-    unique = sa.Column(sa.String)
     scheduler_locked_at = sa.Column(sa.DateTime, index=True)
     scheduler_lock_id = sa.Column(UUID(as_uuid=True), index=True)
     worker_locked_at = sa.Column(sa.DateTime, index=True)
@@ -681,7 +686,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
             'lock_id': lock_id
         }
         if job_types:
-            additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
+            additional_params['job_types'] = '"job_type" IN (\'{}\') and'.format(
                 "','".join(job_types))
         else:
             additional_params['job_types'] = ''
@@ -737,7 +742,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
                              max_jobs):
         additional_params = {}
         if job_types:
-            additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
+            additional_params['job_types'] = '"job_type" IN (\'{}\') and'.format(
                 "','".join(job_types))
         else:
             additional_params['job_types'] = ''
@@ -789,7 +794,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
                              max_jobs):
         additional_params = {}
         if job_types:
-            additional_params['job_types'] = '"job_type" IN (\'{}\')'.format(
+            additional_params['job_types'] = '"job_type" IN (\'{}\') and'.format(
                 "','".join(job_types))
         else:
             additional_params['job_types'] = ''
@@ -819,10 +824,10 @@ class SchedulableInstance(SchedulerUnlockMixin):
 
     @classmethod
     async def timeout_pushed_async(cls,
-                                 session,
-                                 job_types=None,
-                                 now=None,
-                                 max_jobs=1):
+                                   session,
+                                   job_types=None,
+                                   now=None,
+                                   max_jobs=1):
         sql_params, additional_params = cls.timeout_pushed_prepare(
             job_types,
             max_jobs)
@@ -837,14 +842,18 @@ class SchedulableInstance(SchedulerUnlockMixin):
 
     @declared_attr
     def __table_args__(cls):
-        index_name = 'idx_{}_unique_job'.format(cls.__tablename__)
-        extra_unique_columns = getattr(cls, '__extra_unique_columns__', [])
-        columns = extra_unique_columns + [cls.unique]
+        unique_col = getattr(cls, '__unique_column__', None)
+        if unique_col:
+            index_name = 'idx_{}_unique_job'.format(cls.__tablename__)
+            extra_unique_columns = getattr(cls, '__extra_unique_columns__', [])
+            columns = extra_unique_columns + [getattr(cls, unique_col)]
 
-        return (
-            sa.Index(index_name,
-                     *columns,
-                     unique=True,
-                     postgresql_where=cls.status.in_(
-                        ['queued', 'pushed', 'running', 'retry'])),
-        )
+            return (
+                sa.Index(index_name,
+                         *columns,
+                         unique=True,
+                         postgresql_where=cls.status.in_(
+                            ['queued', 'pushed', 'running', 'retry'])),
+            )
+
+        return tuple()
