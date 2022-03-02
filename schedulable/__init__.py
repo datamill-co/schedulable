@@ -604,7 +604,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
         session.commit()
         session.refresh(self)
 
-        if str(self.worker_lock_id) != worker_lock_id:
+        if str(self.worker_lock_id) != str(worker_lock_id):
             raise CouldNotLockResourceException()
 
         return worker_lock_id
@@ -623,7 +623,7 @@ class SchedulableInstance(SchedulerUnlockMixin):
         await session.commit()
         await session.refresh(self)
 
-        if str(self.worker_lock_id) != worker_lock_id:
+        if str(self.worker_lock_id) != str(worker_lock_id):
             raise CouldNotLockResourceException()
 
         return worker_lock_id
