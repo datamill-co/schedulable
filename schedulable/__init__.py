@@ -848,12 +848,19 @@ class SchedulableInstance(SchedulerUnlockMixin):
             extra_unique_columns = getattr(cls, '__extra_unique_columns__', [])
             columns = extra_unique_columns + [getattr(cls, unique_col)]
 
+            kwargs = {
+                'unique': True
+            }
+
+            only_unprocessed = getattr(cls, '__unique_column_only_unprocessed__', True)
+            if only_unprocessed:
+                kwargs['postgresql_where'] = cls.status.in_(
+                    ['queued', 'pushed', 'running', 'retry'])
+
             return (
                 sa.Index(index_name,
                          *columns,
-                         unique=True,
-                         postgresql_where=cls.status.in_(
-                            ['queued', 'pushed', 'running', 'retry'])),
+                         **kwargs),
             )
 
         return tuple()
